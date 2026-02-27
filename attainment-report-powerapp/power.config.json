@@ -1,0 +1,23 @@
+{
+  "version": "1.0",
+  "appId": "3ee3b517-cef3-4300-bb62-be6d3c98224f",
+  "appDisplayName": "Attainment Report Generator",
+  "region": "prod",
+  "environmentId": "8c0f0998-b44d-e8f1-b0b8-97534410a116",
+  "description": "",
+  "buildPath": "./dist",
+  "buildEntryPoint": "index.html",
+  "localAppUrl": "http://localhost:3000",
+  "logoPath": "Default",
+  "connectionReferences": {
+    "502f3db4-01bd-41e4-a0c0-4edc8cf2ee93": {
+      "id": "/providers/Microsoft.PowerApps/apis/shared_office365",
+      "displayName": "Office 365 Outlook",
+      "dataSources": [
+        "office365"
+      ],
+      "dataSets": {}
+    }
+  },
+  "databaseReferences": {}
+}
