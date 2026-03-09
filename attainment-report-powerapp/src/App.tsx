@@ -13,6 +13,7 @@ import {
   createOutlookDrafts,
   DEFAULT_EMAIL_BODY_TEMPLATE,
   DEFAULT_EMAIL_SUBJECT_TEMPLATE,
+  isManualDraftFolderRequiredError,
   sendAllDraftEmailsFromFolder,
 } from './lib/outlookDrafts';
 
@@ -34,6 +35,24 @@ interface ParsedSalesCompInfo {
 
 type UploadZone = 'attainment' | 'sales';
 
+const ATTAINMENT_ACCEPT = '.xlsx,.csv';
+const SALES_COMP_ACCEPT = '.xlsx';
+
+function isSupportedUpload(fileName: string, zone: UploadZone): boolean {
+  const lowerName = fileName.toLowerCase();
+  if (zone === 'attainment') {
+    return lowerName.endsWith('.xlsx') || lowerName.endsWith('.csv');
+  }
+  return lowerName.endsWith('.xlsx');
+}
+
+function getUploadErrorMessage(zone: UploadZone): string {
+  if (zone === 'attainment') {
+    return 'Global Attainment Report supports .xlsx or .csv files.';
+  }
+  return 'Sales Compensation Report supports .xlsx files only.';
+}
+
 function App() {
   const [attainmentInfo, setAttainmentInfo] = useState<ParsedAttainmentInfo | null>(null);
   const [salesCompInfo, setSalesCompInfo] = useState<ParsedSalesCompInfo | null>(null);
@@ -45,6 +64,7 @@ function App() {
   const [isDrafting, setIsDrafting] = useState(false);
   const [isSendingDrafts, setIsSendingDrafts] = useState(false);
   const [showSendConfirmModal, setShowSendConfirmModal] = useState(false);
+  const [manualDraftFolderPrompt, setManualDraftFolderPrompt] = useState<string | null>(null);
   const [progressText, setProgressText] = useState('');
   const [progressValue, setProgressValue] = useState(0);
 
@@ -59,6 +79,8 @@ function App() {
   const [dragOverZone, setDragOverZone] = useState<UploadZone | null>(null);
 
   const filesReady = Boolean(attainmentInfo && salesCompInfo);
+  const attainmentLoaded = Boolean(attainmentInfo);
+  const salesCompLoaded = Boolean(salesCompInfo);
   const regionOptions = attainmentInfo?.availableRegions || [];
   const reportRegionOptions = useMemo(() => {
     if (!generationResult) {
@@ -135,6 +157,7 @@ function App() {
     setOperationMessage('');
     setError(null);
     setShowSendConfirmModal(false);
+    setManualDraftFolderPrompt(null);
   };
 
   const processAttainmentFile = async (file: File) => {
@@ -228,8 +251,8 @@ function App() {
       return;
     }
 
-    if (!file.name.toLowerCase().endsWith('.xlsx')) {
-      setError('Only .xlsx files are supported.');
+    if (!isSupportedUpload(file.name, zone)) {
+      setError(getUploadErrorMessage(zone));
       return;
     }
 
@@ -326,6 +349,7 @@ function App() {
 
     setError(null);
     setOperationMessage('');
+    setManualDraftFolderPrompt(null);
     setIsDrafting(true);
     setProgressValue(0);
     setProgressText('Creating Outlook drafts...');
@@ -349,10 +373,20 @@ function App() {
       const failurePreview = result.failures.slice(0, 3).join(' | ');
       setOperationMessage(failurePreview ? `${summary} Examples: ${failurePreview}` : summary);
     } catch (draftError) {
-      setError(toErrorMessage(draftError));
+      if (isManualDraftFolderRequiredError(draftError)) {
+        setError(null);
+        setOperationMessage('');
+        setManualDraftFolderPrompt(draftError.folderPath);
+      } else {
+        setError(toErrorMessage(draftError));
+      }
     } finally {
       setIsDrafting(false);
     }
+  };
+
+  const closeManualDraftFolderPrompt = () => {
+    setManualDraftFolderPrompt(null);
   };
 
   const executeSendDraftEmails = async () => {
@@ -428,7 +462,7 @@ function App() {
             <div className="upload-card">
               <h3>Global Attainment Report</h3>
               <div
-                className={`file-picker-row ${dragOverZone === 'attainment' ? 'drag-active' : ''}`}
+                className={`file-picker-row ${dragOverZone === 'attainment' ? 'drag-active' : ''} ${attainmentLoaded ? 'loaded' : ''}`}
                 onDragOver={(event) => handleUploadDragOver(event, 'attainment')}
                 onDragLeave={(event) => handleUploadDragLeave(event, 'attainment')}
                 onDrop={(event) => handleUploadDrop(event, 'attainment')}
@@ -437,26 +471,40 @@ function App() {
                   id="attainment-file-input"
                   className="file-input-hidden"
                   type="file"
-                  accept=".xlsx"
+                  accept={ATTAINMENT_ACCEPT}
                   onChange={handleAttainmentUpload}
                   disabled={uploadsDisabled}
                 />
-                <label
-                  htmlFor="attainment-file-input"
-                  className={`file-select-btn ${uploadsDisabled ? 'disabled' : ''}`}
-                >
-                  Choose File
-                </label>
-                <span className="file-load-status">
-                  {attainmentInfo ? attainmentInfo.fileName : 'Drop .xlsx file here or choose file'}
-                </span>
+                {attainmentInfo ? (
+                  <label
+                    htmlFor="attainment-file-input"
+                    className={`file-picker-loaded ${uploadsDisabled ? 'disabled' : ''}`}
+                  >
+                    <span className="file-status-chip">Uploaded</span>
+                    <span className="file-loaded-name">{attainmentInfo.fileName}</span>
+                    <span className="file-replace-hint">Click to replace</span>
+                  </label>
+                ) : (
+                  <>
+                    <label
+                      htmlFor="attainment-file-input"
+                      className={`file-select-btn ${uploadsDisabled ? 'disabled' : ''}`}
+                    >
+                      Choose File
+                    </label>
+                    <span className="file-load-status">Drop .xlsx or .csv file here or choose file</span>
+                  </>
+                )}
               </div>
+              {attainmentInfo ? (
+                <p className="upload-note success">{attainmentInfo.rows.length.toLocaleString()} attainment rows loaded</p>
+              ) : null}
             </div>
 
             <div className="upload-card">
               <h3>Sales Compensation Report</h3>
               <div
-                className={`file-picker-row ${dragOverZone === 'sales' ? 'drag-active' : ''}`}
+                className={`file-picker-row ${dragOverZone === 'sales' ? 'drag-active' : ''} ${salesCompLoaded ? 'loaded' : ''}`}
                 onDragOver={(event) => handleUploadDragOver(event, 'sales')}
                 onDragLeave={(event) => handleUploadDragLeave(event, 'sales')}
                 onDrop={(event) => handleUploadDrop(event, 'sales')}
@@ -465,20 +513,36 @@ function App() {
                   id="sales-comp-file-input"
                   className="file-input-hidden"
                   type="file"
-                  accept=".xlsx"
+                  accept={SALES_COMP_ACCEPT}
                   onChange={handleSalesCompUpload}
                   disabled={uploadsDisabled}
                 />
-                <label
-                  htmlFor="sales-comp-file-input"
-                  className={`file-select-btn ${uploadsDisabled ? 'disabled' : ''}`}
-                >
-                  Choose File
-                </label>
-                <span className="file-load-status">
-                  {salesCompInfo ? salesCompInfo.fileName : 'Drop .xlsx file here or choose file'}
-                </span>
+                {salesCompInfo ? (
+                  <label
+                    htmlFor="sales-comp-file-input"
+                    className={`file-picker-loaded ${uploadsDisabled ? 'disabled' : ''}`}
+                  >
+                    <span className="file-status-chip">Uploaded</span>
+                    <span className="file-loaded-name">{salesCompInfo.fileName}</span>
+                    <span className="file-replace-hint">Click to replace</span>
+                  </label>
+                ) : (
+                  <>
+                    <label
+                      htmlFor="sales-comp-file-input"
+                      className={`file-select-btn ${uploadsDisabled ? 'disabled' : ''}`}
+                    >
+                      Choose File
+                    </label>
+                    <span className="file-load-status">Drop .xlsx file here or choose file</span>
+                  </>
+                )}
               </div>
+              {salesCompInfo ? (
+                <p className="upload-note success">
+                  {salesCompInfo.count.toLocaleString()} employee email records loaded
+                </p>
+              ) : null}
             </div>
           </div>
         </section>
@@ -708,6 +772,29 @@ function App() {
                 disabled={isSendingDrafts}
               >
                 Send
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {manualDraftFolderPrompt ? (
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="manual-folder-title"
+        >
+          <div className="confirm-modal">
+            <h3 id="manual-folder-title">Manual Folder Setup Required</h3>
+            <p>This environment blocks automatic Outlook folder creation.</p>
+            <p>
+              Please create <strong>{manualDraftFolderPrompt}</strong> under Drafts in Outlook, then click
+              Create Outlook Drafts again.
+            </p>
+            <div className="confirm-actions">
+              <button className="primary-btn" type="button" onClick={closeManualDraftFolderPrompt}>
+                OK
               </button>
             </div>
           </div>

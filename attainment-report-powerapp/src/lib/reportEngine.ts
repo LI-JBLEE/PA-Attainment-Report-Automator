@@ -95,9 +95,14 @@ const PLAN_PERIOD_OLD_COLUMN = 'Plan_Period;MBO_Description';
 const PLAN_PERIOD_COLUMN = 'Plan_Period';
 const ATT_SHEET_NAME = 'in';
 const SALES_COMP_SHEET_NAME = 'Sheet1';
+const SALES_COMP_HEADER_ROW_INDEX = 3;
+const SALES_COMP_HEADER_SCAN_LIMIT = 10;
 const OTHER_REGION = 'OTHER';
 const MAX_EXCEL_OUTLINE_LEVEL = 7;
 const ENABLE_OUTLINE_GROUPING = false;
+const CELL_ADDRESS_PATTERN = /^[A-Z]+[1-9][0-9]*$/;
+
+const SALES_COMP_REQUIRED_HEADERS = ['Employee ID', 'Email - Work'] as const;
 
 const ATT_COLUMNS = new Set([
   'Q1 Att',
@@ -124,6 +129,14 @@ const NUMBER_COLUMNS = new Set([
   '2H Quota',
   'Annual Credits',
   'Annual Quota',
+]);
+
+const ATTAINMENT_DATE_COLUMNS = new Set(['Person Hire Date', 'Quota Start Date', 'Quota End Date']);
+const ATTAINMENT_NUMERIC_COLUMNS = new Set<string>([
+  ...Array.from(ATT_COLUMNS),
+  ...Array.from(NUMBER_COLUMNS),
+  'Measure Weight',
+  'Fiscal Year',
 ]);
 
 const COLUMN_WIDTHS: Record<string, number> = {
@@ -273,17 +286,20 @@ export function normalizeEmployeeId(value: unknown): string | null {
 
 export async function parseAttainmentWorkbook(file: File): Promise<AttainmentValidationResult> {
   const workbook = await readWorkbook(file);
-  const sheet = workbook.Sheets[ATT_SHEET_NAME];
+  const sheet = getAttainmentSheet(workbook, file.name);
 
   if (!sheet) {
     throw new Error(`Cannot find sheet "${ATT_SHEET_NAME}" in attainment workbook.`);
   }
 
-  const rows = XLSX.utils
-    .sheet_to_json<JsonRow>(sheet, { defval: null, raw: true })
-    .map(normalizeAttainmentRow);
+  let rows = parseAttainmentRows(sheet);
 
-  const hasManagerColumn = rows.some((row) => Object.prototype.hasOwnProperty.call(row, 'Level_1_Manager'));
+  let hasManagerColumn = rows.some((row) => Object.prototype.hasOwnProperty.call(row, 'Level_1_Manager'));
+  if (!hasManagerColumn && repairWorksheetRange(sheet)) {
+    rows = parseAttainmentRows(sheet);
+    hasManagerColumn = rows.some((row) => Object.prototype.hasOwnProperty.call(row, 'Level_1_Manager'));
+  }
+
   if (!hasManagerColumn) {
     throw new Error('Missing required column: Level_1_Manager');
   }
@@ -310,22 +326,14 @@ export async function parseSalesCompWorkbook(file: File): Promise<SalesCompValid
     throw new Error(`Cannot find sheet "${SALES_COMP_SHEET_NAME}" in Sales Compensation workbook.`);
   }
 
-  const rows = XLSX.utils.sheet_to_json<JsonRow>(sheet, {
-    range: 3,
-    defval: null,
-    raw: true,
-  });
-
-  const emailMap: Record<string, string> = {};
-  for (const row of rows) {
-    const employeeId = normalizeEmployeeId(row['Employee ID']);
-    const email = asString(row['Email - Work']);
-    if (!employeeId || !email) {
-      continue;
-    }
-    emailMap[employeeId] = email;
+  const headerInfo = findSalesCompHeaderInfo(sheet);
+  if (!headerInfo) {
+    throw new Error(
+      'Cannot find Sales Compensation headers. Expected row 4 to include "Employee ID" and "Email - Work".',
+    );
   }
 
+  const emailMap = buildSalesCompEmailMap(sheet, headerInfo);
   if (Object.keys(emailMap).length === 0) {
     throw new Error('Missing valid records for "Employee ID" and "Email - Work".');
   }
@@ -437,10 +445,22 @@ function normalizeAttainmentRow(row: JsonRow): AttainmentRow {
 
   for (const [key, value] of Object.entries(row)) {
     const normalizedKey = key === PLAN_PERIOD_OLD_COLUMN ? PLAN_PERIOD_COLUMN : key;
-    output[normalizedKey] = normalizeCellValue(value);
+    output[normalizedKey] = normalizeAttainmentCellValue(normalizedKey, value);
   }
 
   return output;
+}
+
+function normalizeAttainmentCellValue(columnName: string, value: unknown): CellValue {
+  if (ATTAINMENT_DATE_COLUMNS.has(columnName)) {
+    return normalizeDateCellValue(value);
+  }
+
+  if (ATTAINMENT_NUMERIC_COLUMNS.has(columnName)) {
+    return normalizeNumericCellValue(value);
+  }
+
+  return normalizeCellValue(value);
 }
 
 function normalizeCellValue(value: unknown): CellValue {
@@ -456,6 +476,66 @@ function normalizeCellValue(value: unknown): CellValue {
   if (typeof value === 'number' || typeof value === 'boolean') {
     return value;
   }
+  return null;
+}
+
+function normalizeNumericCellValue(value: unknown): CellValue {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    const parsed = Number(trimmed.replace(/,/g, ''));
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+
+    return sanitizeExcelString(value);
+  }
+
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  return null;
+}
+
+function normalizeDateCellValue(value: unknown): CellValue {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (value instanceof Date && Number.isFinite(value.getTime())) {
+    return value;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return excelSerialToDate(value);
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    const parsedDate = parseDateStringValue(trimmed);
+    if (parsedDate) {
+      return parsedDate;
+    }
+
+    return sanitizeExcelString(value);
+  }
+
   return null;
 }
 
@@ -493,6 +573,24 @@ function getFiscalYear(rows: AttainmentRow[]): string {
   }
 
   return 'FY26';
+}
+
+function getAttainmentSheet(workbook: XLSX.WorkBook, fileName: string): XLSX.WorkSheet | null {
+  const defaultSheet = workbook.Sheets[ATT_SHEET_NAME];
+  if (defaultSheet) {
+    return defaultSheet;
+  }
+
+  if (!isCsvFileName(fileName)) {
+    return null;
+  }
+
+  const firstSheetName = workbook.SheetNames[0];
+  return firstSheetName ? workbook.Sheets[firstSheetName] || null : null;
+}
+
+function isCsvFileName(fileName: string): boolean {
+  return fileName.toLowerCase().endsWith('.csv');
 }
 
 function getAllRegions(rows: AttainmentRow[]): string[] {
@@ -916,7 +1014,12 @@ function asNumber(value: unknown): number | null {
     return value;
   }
   if (typeof value === 'string') {
-    const parsed = Number(value);
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    const parsed = Number(trimmed.replace(/,/g, ''));
     return Number.isFinite(parsed) ? parsed : null;
   }
   return null;
@@ -928,11 +1031,76 @@ function toExcelDateSerial(value: unknown): number | null {
   }
 
   if (value instanceof Date && Number.isFinite(value.getTime())) {
-    const excelSerial = value.getTime() / 86400000 + 25569;
-    return Math.round(excelSerial);
+    return dateToExcelSerial(value);
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    const parsedDate = parseDateStringValue(trimmed);
+    if (parsedDate) {
+      return dateToExcelSerial(parsedDate);
+    }
   }
 
   return null;
+}
+
+function excelSerialToDate(value: number): Date | null {
+  if (!Number.isFinite(value)) {
+    return null;
+  }
+
+  const utcMillis = Math.round((value - 25569) * 86400000);
+  const date = new Date(utcMillis);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
+function dateToExcelSerial(value: Date): number {
+  return Math.round(value.getTime() / 86400000 + 25569);
+}
+
+function parseDateStringValue(value: string): Date | null {
+  const isoMatch = value.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (isoMatch) {
+    return createUtcDate(Number(isoMatch[1]), Number(isoMatch[2]), Number(isoMatch[3]));
+  }
+
+  const slashMatch = value.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (slashMatch) {
+    return createUtcDate(Number(slashMatch[3]), Number(slashMatch[1]), Number(slashMatch[2]));
+  }
+
+  return null;
+}
+
+function createUtcDate(year: number, month: number, day: number): Date | null {
+  if (
+    !Number.isInteger(year) ||
+    !Number.isInteger(month) ||
+    !Number.isInteger(day) ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31
+  ) {
+    return null;
+  }
+
+  const date = new Date(Date.UTC(year, month - 1, day));
+  if (
+    !Number.isFinite(date.getTime()) ||
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    return null;
+  }
+
+  return date;
 }
 
 async function sanitizeWorkbookXml(bytes: Uint8Array, maxOutlineLevel: number): Promise<Uint8Array> {
@@ -1015,6 +1183,184 @@ function formatDateIso(date: Date): string {
   const month = String(date.getMonth() + 1).padStart(2, '0');
   const day = String(date.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
+}
+
+function parseAttainmentRows(sheet: XLSX.WorkSheet): AttainmentRow[] {
+  return XLSX.utils.sheet_to_json<JsonRow>(sheet, { defval: null, raw: true }).map(normalizeAttainmentRow);
+}
+
+function findSalesCompHeaderInfo(
+  sheet: XLSX.WorkSheet,
+): { rowIndex: number; employeeIdCol: number; emailCol: number } | null {
+  const rowValues = new Map<number, Map<number, string>>();
+
+  for (const key of Object.keys(sheet)) {
+    if (!CELL_ADDRESS_PATTERN.test(key)) {
+      continue;
+    }
+
+    const cellAddress = XLSX.utils.decode_cell(key);
+    if (cellAddress.r > SALES_COMP_HEADER_SCAN_LIMIT) {
+      continue;
+    }
+
+    const value = asString(readWorksheetCellValue(sheet[key]));
+    if (!value) {
+      continue;
+    }
+
+    let row = rowValues.get(cellAddress.r);
+    if (!row) {
+      row = new Map<number, string>();
+      rowValues.set(cellAddress.r, row);
+    }
+    row.set(cellAddress.c, value);
+  }
+
+  const candidateRowIndexes = [
+    SALES_COMP_HEADER_ROW_INDEX,
+    ...Array.from({ length: SALES_COMP_HEADER_SCAN_LIMIT + 1 }, (_, index) => index).filter(
+      (index) => index !== SALES_COMP_HEADER_ROW_INDEX,
+    ),
+  ];
+
+  for (const rowIndex of candidateRowIndexes) {
+    const row = rowValues.get(rowIndex);
+    if (!row) {
+      continue;
+    }
+
+    let employeeIdCol: number | null = null;
+    let emailCol: number | null = null;
+
+    for (const [columnIndex, headerText] of row.entries()) {
+      if (headerText === SALES_COMP_REQUIRED_HEADERS[0]) {
+        employeeIdCol = columnIndex;
+      }
+      if (headerText === SALES_COMP_REQUIRED_HEADERS[1]) {
+        emailCol = columnIndex;
+      }
+    }
+
+    if (employeeIdCol !== null && emailCol !== null) {
+      return {
+        rowIndex,
+        employeeIdCol,
+        emailCol,
+      };
+    }
+  }
+
+  return null;
+}
+
+function buildSalesCompEmailMap(
+  sheet: XLSX.WorkSheet,
+  headerInfo: { rowIndex: number; employeeIdCol: number; emailCol: number },
+): Record<string, string> {
+  const emailMap: Record<string, string> = {};
+  const employeeIdsByRow = new Map<number, unknown>();
+  const emailsByRow = new Map<number, unknown>();
+
+  for (const key of Object.keys(sheet)) {
+    if (!CELL_ADDRESS_PATTERN.test(key)) {
+      continue;
+    }
+
+    const cellAddress = XLSX.utils.decode_cell(key);
+    if (cellAddress.r <= headerInfo.rowIndex) {
+      continue;
+    }
+
+    const cellValue = readWorksheetCellValue(sheet[key]);
+    if (cellAddress.c === headerInfo.employeeIdCol) {
+      employeeIdsByRow.set(cellAddress.r, cellValue);
+    } else if (cellAddress.c === headerInfo.emailCol) {
+      emailsByRow.set(cellAddress.r, cellValue);
+    }
+  }
+
+  for (const [rowIndex, rawEmployeeId] of employeeIdsByRow.entries()) {
+    const employeeId = normalizeEmployeeId(rawEmployeeId);
+    const email = asString(emailsByRow.get(rowIndex));
+    if (!employeeId || !email) {
+      continue;
+    }
+    emailMap[employeeId] = email;
+  }
+
+  return emailMap;
+}
+
+function readWorksheetCellValue(cell: XLSX.CellObject | undefined): unknown {
+  if (!cell) {
+    return null;
+  }
+
+  if ('v' in cell && cell.v !== undefined) {
+    return cell.v;
+  }
+
+  if ('w' in cell && cell.w !== undefined) {
+    return cell.w;
+  }
+
+  return null;
+}
+
+function repairWorksheetRange(sheet: XLSX.WorkSheet): boolean {
+  let minRow = Number.POSITIVE_INFINITY;
+  let minCol = Number.POSITIVE_INFINITY;
+  let maxRow = -1;
+  let maxCol = -1;
+
+  for (const key of Object.keys(sheet)) {
+    if (!CELL_ADDRESS_PATTERN.test(key)) {
+      continue;
+    }
+
+    const cell = XLSX.utils.decode_cell(key);
+    minRow = Math.min(minRow, cell.r);
+    minCol = Math.min(minCol, cell.c);
+    maxRow = Math.max(maxRow, cell.r);
+    maxCol = Math.max(maxCol, cell.c);
+  }
+
+  if (maxRow < 0 || maxCol < 0) {
+    return false;
+  }
+
+  const recoveredRange = XLSX.utils.encode_range({
+    s: { r: minRow, c: minCol },
+    e: { r: maxRow, c: maxCol },
+  });
+
+  const currentRangeRef = sheet['!ref'];
+  if (!currentRangeRef) {
+    sheet['!ref'] = recoveredRange;
+    return true;
+  }
+
+  try {
+    const currentRange = XLSX.utils.decode_range(currentRangeRef);
+    const recoveredBounds = XLSX.utils.decode_range(recoveredRange);
+    const needsExpansion =
+      recoveredBounds.s.r < currentRange.s.r ||
+      recoveredBounds.s.c < currentRange.s.c ||
+      recoveredBounds.e.r > currentRange.e.r ||
+      recoveredBounds.e.c > currentRange.e.c;
+
+    if (!needsExpansion) {
+      return false;
+    }
+  } catch {
+    sheet['!ref'] = recoveredRange;
+    return true;
+  }
+
+  // Some SCR exports carry a truncated !ref (for example, "A1") even though the cells exist.
+  sheet['!ref'] = recoveredRange;
+  return true;
 }
 
 async function readWorkbook(file: File): Promise<XLSX.WorkBook> {
