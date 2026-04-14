@@ -53,16 +53,24 @@ export class ManualDraftFolderRequiredError extends Error {
   }
 }
 
+export class DraftFolderNotEmptyError extends Error {
+  readonly folderPath: string;
+  readonly draftCount: number;
+
+  constructor(folderPath: string, draftCount: number) {
+    const label = draftCount === 1 ? 'draft email' : 'draft emails';
+    super(`${folderPath} already contains ${draftCount} ${label}. Clear the folder and click Create Outlook Drafts again.`);
+    this.name = 'DraftFolderNotEmptyError';
+    this.folderPath = folderPath;
+    this.draftCount = draftCount;
+  }
+}
+
 interface DraftOptions {
   fiscalYear: string;
   subjectTemplate: string;
   bodyTemplate: string;
   targetFolderName?: string;
-}
-
-interface MailFolderItem {
-  id?: string;
-  displayName?: string;
 }
 
 interface DraftMessageItem {
@@ -71,8 +79,7 @@ interface DraftMessageItem {
 }
 
 interface DraftSubFolderResolution {
-  folderId: string | null;
-  note: string | null;
+  resolvedFolderPath: string;
 }
 
 const DEFAULT_DRAFT_FOLDER = 'Manager Report';
@@ -87,7 +94,6 @@ export async function createOutlookDrafts(
   const targetFolderName = options.targetFolderName || DEFAULT_DRAFT_FOLDER;
   const targetFolderPath = `${DRAFT_FOLDER_PATH_PREFIX}/${targetFolderName}`;
   const folderResolution = await ensureDraftSubFolder(targetFolderName);
-  const folderId = folderResolution.folderId;
 
   let created = 0;
   let failed = 0;
@@ -149,10 +155,9 @@ export async function createOutlookDrafts(
       try {
         movedMessageId = await moveDraftToFolder(
           messageId,
-          folderId,
+          folderResolution.resolvedFolderPath,
           targetFolderPath,
           targetFolderName,
-          folderResolution.note,
         );
       } catch (moveError) {
         await deleteDraftIfExists(messageId);
@@ -338,112 +343,45 @@ export async function sendAllDraftEmailsFromFolder(
 }
 
 async function ensureDraftSubFolder(folderName: string): Promise<DraftSubFolderResolution> {
-  const errors: string[] = [];
-  const draftsFolder = await resolveDraftsFolder(errors);
+  const targetFolderPath = `${DRAFT_FOLDER_PATH_PREFIX}/${folderName}`;
+  const draftsCheck = await listDraftMessages(DRAFT_FOLDER_PATH_PREFIX);
 
-  const childFolderUris = new Set<string>([
-    '/me/mailFolders/drafts/childFolders',
-    '/me/mailFolders/Drafts/childFolders',
-    'https://graph.microsoft.com/v1.0/me/mailFolders/drafts/childFolders',
-    'https://graph.microsoft.com/v1.0/me/mailFolders/Drafts/childFolders',
-  ]);
-
-  if (draftsFolder?.id) {
-    const encodedId = encodeURIComponent(draftsFolder.id);
-    childFolderUris.add(`/me/mailFolders/${encodedId}/childFolders`);
-    childFolderUris.add(`https://graph.microsoft.com/v1.0/me/mailFolders/${encodedId}/childFolders`);
+  if (!draftsCheck.success) {
+    throw new Error(
+      `Unable to access Outlook Drafts folder. ${draftsCheck.errorText || 'The connector did not return a result.'}`,
+    );
   }
 
-  for (const uri of childFolderUris) {
-    const existingId = await tryGetChildFolderId(uri, folderName, errors);
-    if (existingId) {
-      return { folderId: existingId, note: null };
-    }
-
-    const createdId = await tryCreateChildFolder(uri, folderName, errors);
-    if (createdId) {
-      return { folderId: createdId, note: null };
-    }
-
-    const existingAfterCreateId = await tryGetChildFolderId(uri, folderName, errors);
-    if (existingAfterCreateId) {
-      return { folderId: existingAfterCreateId, note: null };
-    }
-  }
-
-  if (errors.length > 0 && errors.every((error) => isDlpBlockedText(error))) {
-    return {
-      folderId: null,
-      note: `Automatic folder creation is blocked by tenant DLP policy. Create Drafts/${folderName} manually once, then rerun.`,
-    };
-  }
-
-  throw new Error(
-    `Unable to ensure Drafts/${folderName} exists. ${errors.join(' | ') || 'No folder APIs succeeded.'}`,
-  );
-}
-
-async function resolveDraftsFolder(errors: string[]): Promise<MailFolderItem | null> {
-  const candidateUris = [
-    '/me/mailFolders/drafts',
-    '/me/mailFolders/Drafts',
-    'https://graph.microsoft.com/v1.0/me/mailFolders/drafts',
-    'https://graph.microsoft.com/v1.0/me/mailFolders/Drafts',
+  const candidatePaths = [
+    targetFolderPath,
+    `${DRAFT_FOLDER_PATH_PREFIX}\\${folderName}`,
+    folderName,
   ];
 
-  for (const uri of candidateUris) {
-    const response = await Office365OutlookService.HttpRequest(uri, 'GET');
-    if (!response.success) {
-      errors.push(`Get Drafts folder failed for ${uri}: ${toOperationErrorMessage(response.error)}`);
+  for (const path of candidatePaths) {
+    const result = await listDraftMessages(path);
+    if (!result.success) {
       continue;
     }
 
-    const folder = extractMailFolder(response.data);
-    if (folder?.id) {
-      return folder;
+    if (result.items.length > 0) {
+      throw new DraftFolderNotEmptyError(targetFolderPath, result.items.length);
     }
 
-    errors.push(`Get Drafts folder returned no folder id for ${uri}.`);
+    return {
+      resolvedFolderPath: path,
+    };
   }
 
-  return null;
-}
-
-async function tryGetChildFolderId(uri: string, folderName: string, errors: string[]): Promise<string | null> {
-  const response = await Office365OutlookService.HttpRequest(uri, 'GET');
-  if (!response.success) {
-    errors.push(`List child folders failed for ${uri}: ${toOperationErrorMessage(response.error)}`);
-    return null;
-  }
-
-  const existing = extractMailFolderByName(response.data, folderName);
-  if (existing?.id) {
-    return existing.id;
-  }
-
-  return null;
-}
-
-async function tryCreateChildFolder(uri: string, folderName: string, errors: string[]): Promise<string | null> {
-  const createBody = JSON.stringify({ displayName: folderName });
-  const response = await Office365OutlookService.HttpRequest(uri, 'POST', createBody, 'application/json');
-  if (!response.success) {
-    errors.push(`Create child folder failed for ${uri}: ${toOperationErrorMessage(response.error)}`);
-    return null;
-  }
-
-  const createdFolder = extractMailFolder(response.data);
-  if (createdFolder?.id) {
-    return createdFolder.id;
-  }
-
-  errors.push(`Create child folder succeeded for ${uri} but returned no folder id.`);
-  return null;
+  throw new ManualDraftFolderRequiredError(
+    targetFolderPath,
+    `${targetFolderPath} folder was not found.`,
+  );
 }
 
 async function listDraftMessages(
   folderPath: string,
-): Promise<{ success: boolean; items: DraftMessageItem[] }> {
+): Promise<{ success: boolean; items: DraftMessageItem[]; errorText?: string }> {
   const pageSize = 100;
   let skip = 0;
   const idSet = new Set<string>();
@@ -460,7 +398,11 @@ async function listDraftMessages(
     );
 
     if (!response.success) {
-      return { success: false, items: [] };
+      return {
+        success: false,
+        items: [],
+        errorText: toOperationErrorMessage(response.error),
+      };
     }
 
     const page = Array.isArray(response.data) ? response.data : [];
@@ -494,36 +436,17 @@ async function listDraftMessages(
 
 async function moveDraftToFolder(
   messageId: string,
-  folderId: string | null,
+  resolvedFolderPath: string,
   targetFolderPath: string,
   targetFolderName: string,
-  folderResolutionNote?: string | null,
 ): Promise<string> {
   const moveErrors: string[] = [];
 
-  if (folderId) {
-    const body = JSON.stringify({ destinationId: folderId });
-    const response = await Office365OutlookService.HttpRequest(
-      `/me/messages/${encodeURIComponent(messageId)}/move`,
-      'POST',
-      body,
-      'application/json',
-    );
+  const candidatePaths = Array.from(
+    new Set([resolvedFolderPath, targetFolderPath, `${DRAFT_FOLDER_PATH_PREFIX}\\${targetFolderName}`, targetFolderName]),
+  );
 
-    if (response.success) {
-      const movedId = extractMessageIdFromUnknown(response.data);
-      return movedId || messageId;
-    }
-    moveErrors.push(`Graph move by folderId failed: ${toOperationErrorMessage(response.error)}`);
-  } else {
-    if (folderResolutionNote) {
-      moveErrors.push(folderResolutionNote);
-    }
-    moveErrors.push('Manager Report folder id could not be resolved.');
-  }
-
-  const fallbackPaths = [targetFolderPath, `${DRAFT_FOLDER_PATH_PREFIX}\\${targetFolderName}`, targetFolderName];
-  for (const folderPath of fallbackPaths) {
+  for (const folderPath of candidatePaths) {
     const moveV2Response = await Office365OutlookService.MoveV2(messageId, folderPath);
     if (moveV2Response.success) {
       const movedId = asOptionalString((moveV2Response.data as { id?: unknown }).id);
@@ -537,20 +460,6 @@ async function moveDraftToFolder(
       return movedId || messageId;
     }
     moveErrors.push(`Move(${folderPath}) failed: ${toOperationErrorMessage(moveResponse.error)}`);
-  }
-
-  const actionableMoveErrors = moveErrors.filter(
-    (error) =>
-      error !== 'Manager Report folder id could not be resolved.' &&
-      error !== folderResolutionNote,
-  );
-
-  if (
-    folderResolutionNote &&
-    actionableMoveErrors.length > 0 &&
-    actionableMoveErrors.every((error) => isMissingFolderText(error))
-  ) {
-    throw new ManualDraftFolderRequiredError(targetFolderPath, folderResolutionNote);
   }
 
   throw new Error(
@@ -597,43 +506,6 @@ async function deleteDraftIfExists(messageId: string): Promise<void> {
   if (deleteResponse.success) {
     return;
   }
-}
-
-function extractMailFolderByName(data: unknown, folderName: string): MailFolderItem | null {
-  if (!data || typeof data !== 'object') {
-    return null;
-  }
-
-  const maybeValue = (data as { value?: unknown }).value;
-  if (!Array.isArray(maybeValue)) {
-    return null;
-  }
-
-  for (const item of maybeValue) {
-    if (!item || typeof item !== 'object') {
-      continue;
-    }
-
-    const folder = item as MailFolderItem;
-    if (folder.displayName === folderName) {
-      return folder;
-    }
-  }
-
-  return null;
-}
-
-function extractMailFolder(data: unknown): MailFolderItem | null {
-  if (!data || typeof data !== 'object') {
-    return null;
-  }
-
-  const folder = data as MailFolderItem;
-  if (asOptionalString(folder.id)) {
-    return folder;
-  }
-
-  return null;
 }
 
 function resolveTemplate(template: string, managerName: string, fiscalYear: string): string {
@@ -711,16 +583,12 @@ function toOperationErrorMessage(error: unknown): string {
   return text || 'unknown connector error';
 }
 
-function isDlpBlockedText(value: string): boolean {
-  return value.includes('Request blocked due to DLP policies') && value.includes('HttpRequest');
-}
-
-function isMissingFolderText(value: string): boolean {
-  return value.includes('Specified folder') && value.includes('does not exist');
-}
-
 export function isManualDraftFolderRequiredError(error: unknown): error is ManualDraftFolderRequiredError {
   return error instanceof ManualDraftFolderRequiredError;
+}
+
+export function isDraftFolderNotEmptyError(error: unknown): error is DraftFolderNotEmptyError {
+  return error instanceof DraftFolderNotEmptyError;
 }
 
 function extractMessageIdFromUnknown(data: unknown): string | null {

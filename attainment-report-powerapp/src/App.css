@@ -381,6 +381,41 @@ input[type='file'] {
   margin: 8px 0 0;
 }
 
+.setup-note {
+  background: linear-gradient(180deg, #fff8eb 0%, #fff2da 100%);
+  border: 1px solid #f3d19a;
+  border-left: 4px solid #d97706;
+  border-radius: 12px;
+  box-shadow: 0 10px 24px rgba(217, 119, 6, 0.1);
+  margin-top: 18px;
+  padding: 14px 14px 14px 16px;
+}
+
+.setup-note-label {
+  align-items: center;
+  background: rgba(255, 255, 255, 0.9);
+  border: 1px solid #f3d19a;
+  border-radius: 999px;
+  color: #9a3412;
+  display: inline-flex;
+  font-size: 0.58rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  padding: 4px 9px;
+  text-transform: uppercase;
+}
+
+.setup-note p {
+  color: #7c4a03;
+  font-size: 0.7rem;
+  line-height: 1.55;
+  margin: 10px 0 0;
+}
+
+.setup-note strong {
+  color: #92400e;
+}
+
 .manager-list {
   border: 1px solid #e5e7eb;
   border-radius: 10px;

@@ -13,6 +13,7 @@ import {
   createOutlookDrafts,
   DEFAULT_EMAIL_BODY_TEMPLATE,
   DEFAULT_EMAIL_SUBJECT_TEMPLATE,
+  isDraftFolderNotEmptyError,
   isManualDraftFolderRequiredError,
   sendAllDraftEmailsFromFolder,
 } from './lib/outlookDrafts';
@@ -376,7 +377,14 @@ function App() {
       if (isManualDraftFolderRequiredError(draftError)) {
         setError(null);
         setOperationMessage('');
+        setProgressText('');
+        setProgressValue(0);
         setManualDraftFolderPrompt(draftError.folderPath);
+      } else if (isDraftFolderNotEmptyError(draftError)) {
+        setOperationMessage('');
+        setProgressText('');
+        setProgressValue(0);
+        setError(draftError.message);
       } else {
         setError(toErrorMessage(draftError));
       }
@@ -680,6 +688,14 @@ function App() {
                   Selected in current region filter: {selectedReports.length} | With email:{' '}
                   {selectedWithEmail.length} | Without email: {selectedWithoutEmail}
                 </p>
+
+                <aside className="setup-note" role="note" aria-label="Outlook draft folder requirement">
+                  <span className="setup-note-label">Important</span>
+                  <p>
+                    Before selecting <strong>Create Outlook Drafts</strong>, verify that Outlook
+                    contains <strong>Drafts/Manager Report</strong> and that the folder is empty.
+                  </p>
+                </aside>
               </div>
 
               <div className="manager-col">
