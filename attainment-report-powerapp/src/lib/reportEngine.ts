@@ -95,10 +95,11 @@ export interface GenerationResult {
 
 interface BuildIndexResult {
   currentManagerKeys: Set<string>;
-  currentL1ManagerNameByPersonKey: Map<string, string>;
+  currentL1ManagerKeyByPersonKey: Map<string, string>;
   currentPersonNameByKey: Map<string, string>;
   reportsByManager: Map<string, AttainmentRow[]>;
   managerRegion: Map<string, string>;
+  managerNameByKey: Map<string, string>;
   allManagers: string[];
 }
 
@@ -392,13 +393,14 @@ export async function generateManagerReports(params: {
   const reportDate = formatDateCompact(new Date());
 
   const selectedManagers = index.allManagers.filter(
-    (manager) => selectedSet.has(index.managerRegion.get(manager) || OTHER_REGION),
+    (managerKey) => selectedSet.has(index.managerRegion.get(managerKey) || OTHER_REGION),
   );
   const managersToGenerate = selectedManagers
-    .map((manager) => ({
-      manager,
-      region: index.managerRegion.get(manager) || OTHER_REGION,
-      hierarchyData: buildHierarchyData(manager, index, 0, new Set<string>()),
+    .map((managerKey) => ({
+      managerKey,
+      manager: index.managerNameByKey.get(managerKey) || managerKey,
+      region: index.managerRegion.get(managerKey) || OTHER_REGION,
+      hierarchyData: buildHierarchyData(managerKey, index, 0, new Set<string>()),
     }))
     .filter(
       (candidate) =>
@@ -655,35 +657,44 @@ function applySalesCompSupervisors(rows: AttainmentRow[], employeeRecords: Sales
 function buildIndexes(rows: AttainmentRow[]): BuildIndexResult {
   const reportsByManager = new Map<string, AttainmentRow[]>();
   const managerRegion = buildManagerRegionMap(rows);
-  const { currentManagerKeys, currentL1ManagerNameByPersonKey, currentPersonNameByKey } =
+  const managerNameByKey = new Map<string, string>();
+  const { currentManagerKeys, currentL1ManagerKeyByPersonKey, currentPersonNameByKey } =
     buildCurrentHierarchyState(rows);
 
   const managerSet = new Set<string>();
   for (const row of rows) {
     const managerName = asString(row['Level_1_Manager']);
-    if (!managerName) {
+    const managerKey = getPersonKeyFromName(managerName);
+    if (!managerName || !managerKey) {
       continue;
     }
 
-    managerSet.add(managerName);
-    const managerRows = reportsByManager.get(managerName) || [];
+    managerSet.add(managerKey);
+    if (!managerNameByKey.has(managerKey)) {
+      managerNameByKey.set(managerKey, managerName);
+    }
+
+    const managerRows = reportsByManager.get(managerKey) || [];
     managerRows.push(row);
-    reportsByManager.set(managerName, managerRows);
+    reportsByManager.set(managerKey, managerRows);
   }
 
   return {
     currentManagerKeys,
-    currentL1ManagerNameByPersonKey,
+    currentL1ManagerKeyByPersonKey,
     currentPersonNameByKey,
     reportsByManager,
     managerRegion,
-    allManagers: Array.from(managerSet).sort((a, b) => a.localeCompare(b)),
+    managerNameByKey,
+    allManagers: Array.from(managerSet).sort((a, b) =>
+      (managerNameByKey.get(a) || a).localeCompare(managerNameByKey.get(b) || b),
+    ),
   };
 }
 
 function buildCurrentHierarchyState(rows: AttainmentRow[]): {
   currentManagerKeys: Set<string>;
-  currentL1ManagerNameByPersonKey: Map<string, string>;
+  currentL1ManagerKeyByPersonKey: Map<string, string>;
   currentPersonNameByKey: Map<string, string>;
 } {
   const rowsByPersonKey = new Map<string, AttainmentRow[]>();
@@ -700,7 +711,7 @@ function buildCurrentHierarchyState(rows: AttainmentRow[]): {
   }
 
   const currentManagerKeys = new Set<string>();
-  const currentL1ManagerNameByPersonKey = new Map<string, string>();
+  const currentL1ManagerKeyByPersonKey = new Map<string, string>();
   const currentPersonNameByKey = new Map<string, string>();
 
   for (const [personKey, personRows] of rowsByPersonKey.entries()) {
@@ -711,13 +722,14 @@ function buildCurrentHierarchyState(rows: AttainmentRow[]): {
     const currentL1ManagerName = mode(
       latestRows.map((row) => asString(row['Level_1_Manager'])).filter((value): value is string => Boolean(value)),
     );
+    const currentL1ManagerKey = getPersonKeyFromName(currentL1ManagerName);
 
     if (currentPersonName) {
       currentPersonNameByKey.set(personKey, currentPersonName);
     }
 
-    if (currentL1ManagerName) {
-      currentL1ManagerNameByPersonKey.set(personKey, currentL1ManagerName);
+    if (currentL1ManagerKey) {
+      currentL1ManagerKeyByPersonKey.set(personKey, currentL1ManagerKey);
     }
 
     for (const row of latestRows) {
@@ -730,7 +742,7 @@ function buildCurrentHierarchyState(rows: AttainmentRow[]): {
 
   return {
     currentManagerKeys,
-    currentL1ManagerNameByPersonKey,
+    currentL1ManagerKeyByPersonKey,
     currentPersonNameByKey,
   };
 }
@@ -793,41 +805,45 @@ function buildManagerRegionMap(rows: AttainmentRow[]): Map<string, string> {
     }
 
     if (managerName) {
-      const existing = reportsByManager.get(managerName) || [];
+      const managerKey = getPersonKeyFromName(managerName);
+      if (!managerKey) {
+        continue;
+      }
+
+      const existing = reportsByManager.get(managerKey) || [];
       if (region) {
         existing.push(region);
       }
-      reportsByManager.set(managerName, existing);
+      reportsByManager.set(managerKey, existing);
     }
   }
 
-  for (const managerName of reportsByManager.keys()) {
-    const managerId = normalizeEmployeeId(extractManagerId(managerName));
-    if (managerId && idToRegion.has(managerId)) {
-      managerRegion.set(managerName, idToRegion.get(managerId) || OTHER_REGION);
+  for (const managerKey of reportsByManager.keys()) {
+    if (idToRegion.has(managerKey)) {
+      managerRegion.set(managerKey, idToRegion.get(managerKey) || OTHER_REGION);
       continue;
     }
 
-    const inferred = mode(reportsByManager.get(managerName) || []);
-    managerRegion.set(managerName, inferred || OTHER_REGION);
+    const inferred = mode(reportsByManager.get(managerKey) || []);
+    managerRegion.set(managerKey, inferred || OTHER_REGION);
   }
 
   return managerRegion;
 }
 
 function buildHierarchyData(
-  managerName: string,
+  managerKey: string,
   index: BuildIndexResult,
   depth: number,
   visited: Set<string>,
 ): HierarchyItem[] {
-  if (visited.has(managerName)) {
+  if (visited.has(managerKey)) {
     return [];
   }
-  visited.add(managerName);
+  visited.add(managerKey);
 
   const result: HierarchyItem[] = [];
-  const directReports = index.reportsByManager.get(managerName) || [];
+  const directReports = index.reportsByManager.get(managerKey) || [];
   if (directReports.length === 0) {
     return result;
   }
@@ -857,9 +873,9 @@ function buildHierarchyData(
   const directNonManagers: DirectReportEntry[] = [];
 
   for (const entry of directPeople.values()) {
-    const currentL1ManagerName = index.currentL1ManagerNameByPersonKey.get(entry.key);
+    const currentL1ManagerKey = index.currentL1ManagerKeyByPersonKey.get(entry.key);
     const isCurrentManager = index.currentManagerKeys.has(entry.key);
-    if (isCurrentManager && currentL1ManagerName === managerName) {
+    if (isCurrentManager && currentL1ManagerKey === managerKey) {
       directManagers.push(entry);
     } else {
       directNonManagers.push(entry);
@@ -873,16 +889,16 @@ function buildHierarchyData(
   }
 
   for (const entry of directManagers) {
-    const managerPerson = entry.currentPersonName;
+    const managerPerson = index.managerNameByKey.get(entry.key) || entry.currentPersonName;
     result.push({ type: 'section', depth, managerName: managerPerson });
 
-    const managerRows = entry.rows.filter((row) => asString(row['Person Name']) === managerPerson);
+    const managerRows = entry.rows.filter((row) => asString(row['Person Name']) === entry.currentPersonName);
     const rowsToRender = managerRows.length > 0 ? managerRows : entry.rows;
     for (const row of sortReportRows(rowsToRender)) {
       result.push({ type: 'row', depth, row });
     }
 
-    const subItems = buildHierarchyData(managerPerson, index, depth + 1, new Set(visited));
+    const subItems = buildHierarchyData(entry.key, index, depth + 1, new Set(visited));
     result.push(...subItems);
   }
 
