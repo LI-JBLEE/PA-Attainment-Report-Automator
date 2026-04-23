@@ -59,8 +59,18 @@ export interface AttainmentValidationResult {
 
 export interface SalesCompValidationResult {
   emailMap: Record<string, string>;
+  employeeRecords: SalesCompEmployeeMap;
   count: number;
 }
+
+export interface SalesCompEmployeeRecord {
+  email: string | null;
+  activeStatus: string | null;
+  supervisoryManager: string | null;
+  fullName: string | null;
+}
+
+export type SalesCompEmployeeMap = Record<string, SalesCompEmployeeRecord>;
 
 export interface ManagerReportRecord {
   id: string;
@@ -84,11 +94,28 @@ export interface GenerationResult {
 }
 
 interface BuildIndexResult {
-  l1ManagerIds: Set<string>;
-  personIdToL1ManagerName: Map<string, string>;
+  currentManagerKeys: Set<string>;
+  currentL1ManagerNameByPersonKey: Map<string, string>;
+  currentPersonNameByKey: Map<string, string>;
   reportsByManager: Map<string, AttainmentRow[]>;
   managerRegion: Map<string, string>;
   allManagers: string[];
+}
+
+interface DirectReportEntry {
+  key: string;
+  displayName: string;
+  currentPersonName: string;
+  rows: AttainmentRow[];
+}
+
+interface SalesCompHeaderInfo {
+  rowIndex: number;
+  employeeIdCol: number;
+  emailCol: number;
+  activeStatusCol: number;
+  supervisoryManagerCol: number;
+  fullLegalNameCol: number | null;
 }
 
 const PLAN_PERIOD_OLD_COLUMN = 'Plan_Period;MBO_Description';
@@ -102,7 +129,8 @@ const MAX_EXCEL_OUTLINE_LEVEL = 7;
 const ENABLE_OUTLINE_GROUPING = false;
 const CELL_ADDRESS_PATTERN = /^[A-Z]+[1-9][0-9]*$/;
 
-const SALES_COMP_REQUIRED_HEADERS = ['Employee ID', 'Email - Work'] as const;
+const SALES_COMP_REQUIRED_HEADERS = ['Employee ID', 'Email - Work', 'Active Status', 'Supervisory Manager'] as const;
+const SALES_COMP_FULL_LEGAL_NAME_HEADER = 'Full Legal Name';
 
 const ATT_COLUMNS = new Set([
   'Q1 Att',
@@ -329,17 +357,18 @@ export async function parseSalesCompWorkbook(file: File): Promise<SalesCompValid
   const headerInfo = findSalesCompHeaderInfo(sheet);
   if (!headerInfo) {
     throw new Error(
-      'Cannot find Sales Compensation headers. Expected row 4 to include "Employee ID" and "Email - Work".',
+      'Cannot find Sales Compensation headers. Expected row 4 to include "Employee ID", "Email - Work", "Active Status", and "Supervisory Manager".',
     );
   }
 
-  const emailMap = buildSalesCompEmailMap(sheet, headerInfo);
+  const { emailMap, employeeRecords } = buildSalesCompRecords(sheet, headerInfo);
   if (Object.keys(emailMap).length === 0) {
     throw new Error('Missing valid records for "Employee ID" and "Email - Work".');
   }
 
   return {
     emailMap,
+    employeeRecords,
     count: Object.keys(emailMap).length,
   };
 }
@@ -347,36 +376,41 @@ export async function parseSalesCompWorkbook(file: File): Promise<SalesCompValid
 export async function generateManagerReports(params: {
   rows: AttainmentRow[];
   emailMap: Record<string, string>;
+  employeeRecords: SalesCompEmployeeMap;
   selectedRegions: string[];
   fiscalYear: string;
   onProgress?: (current: number, total: number, message: string) => void;
 }): Promise<GenerationResult> {
-  const { rows, emailMap, selectedRegions, fiscalYear, onProgress } = params;
+  const { rows, emailMap, employeeRecords, selectedRegions, fiscalYear, onProgress } = params;
   if (selectedRegions.length === 0) {
     throw new Error('Select at least one region.');
   }
 
   const selectedSet = new Set(selectedRegions);
-  const index = buildIndexes(rows);
+  const effectiveRows = applySalesCompSupervisors(rows, employeeRecords);
+  const index = buildIndexes(effectiveRows);
   const reportDate = formatDateCompact(new Date());
 
-  const managersToGenerate = index.allManagers.filter(
+  const selectedManagers = index.allManagers.filter(
     (manager) => selectedSet.has(index.managerRegion.get(manager) || OTHER_REGION),
   );
+  const managersToGenerate = selectedManagers
+    .map((manager) => ({
+      manager,
+      region: index.managerRegion.get(manager) || OTHER_REGION,
+      hierarchyData: buildHierarchyData(manager, index, 0, new Set<string>()),
+    }))
+    .filter(
+      (candidate) =>
+        candidate.hierarchyData.length > 0 && hasNonTerminatedEmployeeRows(candidate.hierarchyData),
+    );
 
   const total = managersToGenerate.length;
   const regionCounts: Record<string, number> = {};
   const reports: ManagerReportRecord[] = [];
 
   for (let i = 0; i < managersToGenerate.length; i += 1) {
-    const manager = managersToGenerate[i];
-    const hierarchyData = buildHierarchyData(manager, index, 0, new Set<string>());
-
-    if (hierarchyData.length === 0) {
-      continue;
-    }
-
-    const region = index.managerRegion.get(manager) || OTHER_REGION;
+    const { manager, region, hierarchyData } = managersToGenerate[i];
     const cleanName = extractManagerName(manager);
     const safeName = sanitizeFilename(cleanName);
     const fileName = `${fiscalYear}_Attainment_${safeName}_${reportDate}.xlsx`;
@@ -598,11 +632,31 @@ function getAllRegions(rows: AttainmentRow[]): string[] {
   return Array.from(new Set(index.managerRegion.values())).sort((a, b) => a.localeCompare(b));
 }
 
+function applySalesCompSupervisors(rows: AttainmentRow[], employeeRecords: SalesCompEmployeeMap): AttainmentRow[] {
+  return rows.map((row) => {
+    const employeeId = normalizeEmployeeId(row.LI_EMP_ID);
+    if (!employeeId) {
+      return row;
+    }
+
+    const salesCompRecord = employeeRecords[employeeId];
+    const supervisoryManager = asString(salesCompRecord?.supervisoryManager);
+    if (!supervisoryManager || supervisoryManager === asString(row['Level_1_Manager'])) {
+      return row;
+    }
+
+    return {
+      ...row,
+      Level_1_Manager: supervisoryManager,
+    };
+  });
+}
+
 function buildIndexes(rows: AttainmentRow[]): BuildIndexResult {
-  const personIdToL1ManagerName = new Map<string, string>();
-  const l1ManagerIds = new Set<string>();
   const reportsByManager = new Map<string, AttainmentRow[]>();
   const managerRegion = buildManagerRegionMap(rows);
+  const { currentManagerKeys, currentL1ManagerNameByPersonKey, currentPersonNameByKey } =
+    buildCurrentHierarchyState(rows);
 
   const managerSet = new Set<string>();
   for (const row of rows) {
@@ -612,24 +666,113 @@ function buildIndexes(rows: AttainmentRow[]): BuildIndexResult {
     }
 
     managerSet.add(managerName);
-    const managerId = normalizeEmployeeId(extractManagerId(managerName));
-    if (managerId) {
-      personIdToL1ManagerName.set(managerId, managerName);
-      l1ManagerIds.add(managerId);
-    }
-
     const managerRows = reportsByManager.get(managerName) || [];
     managerRows.push(row);
     reportsByManager.set(managerName, managerRows);
   }
 
   return {
-    l1ManagerIds,
-    personIdToL1ManagerName,
+    currentManagerKeys,
+    currentL1ManagerNameByPersonKey,
+    currentPersonNameByKey,
     reportsByManager,
     managerRegion,
     allManagers: Array.from(managerSet).sort((a, b) => a.localeCompare(b)),
   };
+}
+
+function buildCurrentHierarchyState(rows: AttainmentRow[]): {
+  currentManagerKeys: Set<string>;
+  currentL1ManagerNameByPersonKey: Map<string, string>;
+  currentPersonNameByKey: Map<string, string>;
+} {
+  const rowsByPersonKey = new Map<string, AttainmentRow[]>();
+
+  for (const row of rows) {
+    const personKey = getPersonKeyFromRow(row);
+    if (!personKey) {
+      continue;
+    }
+
+    const existingRows = rowsByPersonKey.get(personKey) || [];
+    existingRows.push(row);
+    rowsByPersonKey.set(personKey, existingRows);
+  }
+
+  const currentManagerKeys = new Set<string>();
+  const currentL1ManagerNameByPersonKey = new Map<string, string>();
+  const currentPersonNameByKey = new Map<string, string>();
+
+  for (const [personKey, personRows] of rowsByPersonKey.entries()) {
+    const latestRows = selectLatestRowsByQuotaEndDate(personRows);
+    const currentPersonName = mode(
+      latestRows.map((row) => asString(row['Person Name'])).filter((value): value is string => Boolean(value)),
+    );
+    const currentL1ManagerName = mode(
+      latestRows.map((row) => asString(row['Level_1_Manager'])).filter((value): value is string => Boolean(value)),
+    );
+
+    if (currentPersonName) {
+      currentPersonNameByKey.set(personKey, currentPersonName);
+    }
+
+    if (currentL1ManagerName) {
+      currentL1ManagerNameByPersonKey.set(personKey, currentL1ManagerName);
+    }
+
+    for (const row of latestRows) {
+      const managerKey = getPersonKeyFromName(asString(row['Level_1_Manager']));
+      if (managerKey) {
+        currentManagerKeys.add(managerKey);
+      }
+    }
+  }
+
+  return {
+    currentManagerKeys,
+    currentL1ManagerNameByPersonKey,
+    currentPersonNameByKey,
+  };
+}
+
+function getPersonKeyFromRow(row: AttainmentRow): string | null {
+  return normalizeEmployeeId(row['LI_EMP_ID']) || asString(row['Person Name']);
+}
+
+function getPersonKeyFromName(name: string | null): string | null {
+  if (!name) {
+    return null;
+  }
+
+  return normalizeEmployeeId(extractManagerId(name)) || asString(name);
+}
+
+function selectLatestRowsByQuotaEndDate(rows: AttainmentRow[]): AttainmentRow[] {
+  if (rows.length <= 1) {
+    return rows;
+  }
+
+  let latestValue = Number.NEGATIVE_INFINITY;
+  for (const row of rows) {
+    latestValue = Math.max(latestValue, getQuotaEndDateSortValue(row['Quota End Date']));
+  }
+
+  return rows.filter((row) => getQuotaEndDateSortValue(row['Quota End Date']) === latestValue);
+}
+
+function getQuotaEndDateSortValue(value: CellValue): number {
+  if (value instanceof Date && Number.isFinite(value.getTime())) {
+    return value.getTime();
+  }
+
+  if (typeof value === 'string') {
+    const parsedDate = parseDateStringValue(value.trim());
+    if (parsedDate) {
+      return parsedDate.getTime();
+    }
+  }
+
+  return Number.NEGATIVE_INFINITY;
 }
 
 function buildManagerRegionMap(rows: AttainmentRow[]): Map<string, string> {
@@ -689,56 +832,123 @@ function buildHierarchyData(
     return result;
   }
 
-  const directPeople = new Set<string>();
+  const directPeople = new Map<string, DirectReportEntry>();
   for (const row of directReports) {
     const personName = asString(row['Person Name']);
     if (personName) {
-      directPeople.add(personName);
-    }
-  }
-
-  const directManagers: string[] = [];
-  const directNonManagers: string[] = [];
-
-  for (const personName of directPeople) {
-    const personId = normalizeEmployeeId(extractManagerId(personName));
-    if (personId && index.l1ManagerIds.has(personId)) {
-      directManagers.push(personName);
-    } else {
-      directNonManagers.push(personName);
-    }
-  }
-
-  directNonManagers.sort((a, b) => a.localeCompare(b));
-  directManagers.sort((a, b) => a.localeCompare(b));
-
-  for (const personName of directNonManagers) {
-    for (const row of directReports) {
-      if (asString(row['Person Name']) === personName) {
-        result.push({ type: 'row', depth, row });
+      const personKey = getPersonKeyFromRow(row) || personName;
+      const existingEntry = directPeople.get(personKey);
+      if (existingEntry) {
+        existingEntry.rows.push(row);
+        continue;
       }
+
+      const currentPersonName = index.currentPersonNameByKey.get(personKey) || personName;
+      directPeople.set(personKey, {
+        key: personKey,
+        displayName: personName,
+        currentPersonName,
+        rows: [row],
+      });
     }
   }
 
-  for (const managerPerson of directManagers) {
+  const directManagers: DirectReportEntry[] = [];
+  const directNonManagers: DirectReportEntry[] = [];
+
+  for (const entry of directPeople.values()) {
+    const currentL1ManagerName = index.currentL1ManagerNameByPersonKey.get(entry.key);
+    const isCurrentManager = index.currentManagerKeys.has(entry.key);
+    if (isCurrentManager && currentL1ManagerName === managerName) {
+      directManagers.push(entry);
+    } else {
+      directNonManagers.push(entry);
+    }
+  }
+
+  directManagers.sort((a, b) => a.currentPersonName.localeCompare(b.currentPersonName));
+
+  for (const row of sortReportRows(directNonManagers.flatMap((entry) => entry.rows))) {
+    result.push({ type: 'row', depth, row });
+  }
+
+  for (const entry of directManagers) {
+    const managerPerson = entry.currentPersonName;
     result.push({ type: 'section', depth, managerName: managerPerson });
 
-    for (const row of directReports) {
-      if (asString(row['Person Name']) === managerPerson) {
-        result.push({ type: 'row', depth, row });
-      }
+    const managerRows = entry.rows.filter((row) => asString(row['Person Name']) === managerPerson);
+    const rowsToRender = managerRows.length > 0 ? managerRows : entry.rows;
+    for (const row of sortReportRows(rowsToRender)) {
+      result.push({ type: 'row', depth, row });
     }
 
-    const personId = normalizeEmployeeId(extractManagerId(managerPerson));
-    const l1ManagerName = personId
-      ? index.personIdToL1ManagerName.get(personId) || managerPerson
-      : managerPerson;
-
-    const subItems = buildHierarchyData(l1ManagerName, index, depth + 1, new Set(visited));
+    const subItems = buildHierarchyData(managerPerson, index, depth + 1, new Set(visited));
     result.push(...subItems);
   }
 
   return result;
+}
+
+function hasNonTerminatedEmployeeRows(hierarchyData: HierarchyItem[]): boolean {
+  return hierarchyData.some((item) => item.type === 'row' && !isTerminatedEmployeeStatus(item.row['Employee Status']));
+}
+
+function isTerminatedEmployeeStatus(value: unknown): boolean {
+  return asString(value)?.toLowerCase() === 'terminated';
+}
+
+function sortReportRows(rows: AttainmentRow[]): AttainmentRow[] {
+  return [...rows].sort(compareReportRows);
+}
+
+function compareReportRows(a: AttainmentRow, b: AttainmentRow): number {
+  return (
+    compareEmployeeIds(a.LI_EMP_ID, b.LI_EMP_ID) ||
+    compareNullableNumbers(getQuotaStartDateSortValue(a['Quota Start Date']), getQuotaStartDateSortValue(b['Quota Start Date']), true) ||
+    compareNullableNumbers(asNumber(a['Measure Weight']), asNumber(b['Measure Weight']), false)
+  );
+}
+
+function compareEmployeeIds(a: unknown, b: unknown): number {
+  const aId = normalizeEmployeeId(a);
+  const bId = normalizeEmployeeId(b);
+  const aNumber = aId === null ? null : Number(aId);
+  const bNumber = bId === null ? null : Number(bId);
+
+  if (aNumber !== null && bNumber !== null && Number.isFinite(aNumber) && Number.isFinite(bNumber)) {
+    return aNumber - bNumber;
+  }
+
+  if (aId === null && bId === null) {
+    return 0;
+  }
+  if (aId === null) {
+    return 1;
+  }
+  if (bId === null) {
+    return -1;
+  }
+
+  return aId.localeCompare(bId);
+}
+
+function getQuotaStartDateSortValue(value: CellValue): number | null {
+  const excelDateSerial = toExcelDateSerial(value);
+  return excelDateSerial === null ? null : excelDateSerial;
+}
+
+function compareNullableNumbers(a: number | null, b: number | null, ascending: boolean): number {
+  if (a === null && b === null) {
+    return 0;
+  }
+  if (a === null) {
+    return 1;
+  }
+  if (b === null) {
+    return -1;
+  }
+
+  return ascending ? a - b : b - a;
 }
 
 async function buildWorkbookBytes(
@@ -1189,9 +1399,7 @@ function parseAttainmentRows(sheet: XLSX.WorkSheet): AttainmentRow[] {
   return XLSX.utils.sheet_to_json<JsonRow>(sheet, { defval: null, raw: true }).map(normalizeAttainmentRow);
 }
 
-function findSalesCompHeaderInfo(
-  sheet: XLSX.WorkSheet,
-): { rowIndex: number; employeeIdCol: number; emailCol: number } | null {
+function findSalesCompHeaderInfo(sheet: XLSX.WorkSheet): SalesCompHeaderInfo | null {
   const rowValues = new Map<number, Map<number, string>>();
 
   for (const key of Object.keys(sheet)) {
@@ -1230,23 +1438,30 @@ function findSalesCompHeaderInfo(
       continue;
     }
 
-    let employeeIdCol: number | null = null;
-    let emailCol: number | null = null;
+    const headerColumns = new Map<string, number>();
 
     for (const [columnIndex, headerText] of row.entries()) {
-      if (headerText === SALES_COMP_REQUIRED_HEADERS[0]) {
-        employeeIdCol = columnIndex;
-      }
-      if (headerText === SALES_COMP_REQUIRED_HEADERS[1]) {
-        emailCol = columnIndex;
-      }
+      headerColumns.set(headerText, columnIndex);
     }
 
-    if (employeeIdCol !== null && emailCol !== null) {
+    const employeeIdCol = headerColumns.get(SALES_COMP_REQUIRED_HEADERS[0]);
+    const emailCol = headerColumns.get(SALES_COMP_REQUIRED_HEADERS[1]);
+    const activeStatusCol = headerColumns.get(SALES_COMP_REQUIRED_HEADERS[2]);
+    const supervisoryManagerCol = headerColumns.get(SALES_COMP_REQUIRED_HEADERS[3]);
+
+    if (
+      employeeIdCol !== undefined &&
+      emailCol !== undefined &&
+      activeStatusCol !== undefined &&
+      supervisoryManagerCol !== undefined
+    ) {
       return {
         rowIndex,
         employeeIdCol,
         emailCol,
+        activeStatusCol,
+        supervisoryManagerCol,
+        fullLegalNameCol: headerColumns.get(SALES_COMP_FULL_LEGAL_NAME_HEADER) ?? null,
       };
     }
   }
@@ -1254,13 +1469,17 @@ function findSalesCompHeaderInfo(
   return null;
 }
 
-function buildSalesCompEmailMap(
+function buildSalesCompRecords(
   sheet: XLSX.WorkSheet,
-  headerInfo: { rowIndex: number; employeeIdCol: number; emailCol: number },
-): Record<string, string> {
+  headerInfo: SalesCompHeaderInfo,
+): { emailMap: Record<string, string>; employeeRecords: SalesCompEmployeeMap } {
   const emailMap: Record<string, string> = {};
+  const employeeRecords: SalesCompEmployeeMap = {};
   const employeeIdsByRow = new Map<number, unknown>();
   const emailsByRow = new Map<number, unknown>();
+  const activeStatusesByRow = new Map<number, unknown>();
+  const supervisoryManagersByRow = new Map<number, unknown>();
+  const fullLegalNamesByRow = new Map<number, unknown>();
 
   for (const key of Object.keys(sheet)) {
     if (!CELL_ADDRESS_PATTERN.test(key)) {
@@ -1277,19 +1496,35 @@ function buildSalesCompEmailMap(
       employeeIdsByRow.set(cellAddress.r, cellValue);
     } else if (cellAddress.c === headerInfo.emailCol) {
       emailsByRow.set(cellAddress.r, cellValue);
+    } else if (cellAddress.c === headerInfo.activeStatusCol) {
+      activeStatusesByRow.set(cellAddress.r, cellValue);
+    } else if (cellAddress.c === headerInfo.supervisoryManagerCol) {
+      supervisoryManagersByRow.set(cellAddress.r, cellValue);
+    } else if (headerInfo.fullLegalNameCol !== null && cellAddress.c === headerInfo.fullLegalNameCol) {
+      fullLegalNamesByRow.set(cellAddress.r, cellValue);
     }
   }
 
   for (const [rowIndex, rawEmployeeId] of employeeIdsByRow.entries()) {
     const employeeId = normalizeEmployeeId(rawEmployeeId);
     const email = asString(emailsByRow.get(rowIndex));
-    if (!employeeId || !email) {
+    if (!employeeId) {
       continue;
     }
-    emailMap[employeeId] = email;
+
+    employeeRecords[employeeId] = {
+      email,
+      activeStatus: asString(activeStatusesByRow.get(rowIndex)),
+      supervisoryManager: asString(supervisoryManagersByRow.get(rowIndex)),
+      fullName: asString(fullLegalNamesByRow.get(rowIndex)),
+    };
+
+    if (email) {
+      emailMap[employeeId] = email;
+    }
   }
 
-  return emailMap;
+  return { emailMap, employeeRecords };
 }
 
 function readWorksheetCellValue(cell: XLSX.CellObject | undefined): unknown {

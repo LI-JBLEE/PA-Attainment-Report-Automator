@@ -30,6 +30,7 @@ interface ParsedAttainmentInfo {
 
 interface ParsedSalesCompInfo {
   emailMap: Record<string, string>;
+  employeeRecords: import('./lib/reportEngine').SalesCompEmployeeMap;
   count: number;
   fileName: string;
 }
@@ -285,6 +286,7 @@ function App() {
       const generated = await generateManagerReports({
         rows: attainmentInfo.rows,
         emailMap: salesCompInfo.emailMap,
+        employeeRecords: salesCompInfo.employeeRecords,
         selectedRegions,
         fiscalYear: attainmentInfo.fiscalYear,
         onProgress: (current, total, message) => {
