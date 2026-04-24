@@ -72,10 +72,10 @@
 - 화면 구조: `attainment-report-powerapp/src/App.tsx`
 
 ## 8) 변경 이력
-- 2026-04-24
+- 2026-04-24 (`83af02`)
   - `Level_2_Manager`를 Global Attainment Report 원본 대신 SCR의 `Superior Organization - Level 01 Away` 기준으로 보정
   - 각 매니저 리포트 상단에 매니저 본인 row를 추가하고 팀 데이터와 시각적으로 분리
-- 2026-04-23
+- 2026-04-23 (`550769`, `2c5c82`)
   - Sales Compensation Report의 `Supervisory Manager`를 기준으로 현재 매니저 조직도를 보정
   - 퇴사자만 포함된 매니저 리포트 생성 제외
   - 매니저별 리포트 row 정렬 기준 추가: `LI_EMP_ID`, `Quota Start Date`, `Measure Weight`
