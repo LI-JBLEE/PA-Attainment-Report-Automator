@@ -67,6 +67,7 @@ export interface SalesCompEmployeeRecord {
   email: string | null;
   activeStatus: string | null;
   supervisoryManager: string | null;
+  superiorOrganizationLevel01Away: string | null;
   fullName: string | null;
 }
 
@@ -97,6 +98,7 @@ interface BuildIndexResult {
   currentManagerKeys: Set<string>;
   currentL1ManagerKeyByPersonKey: Map<string, string>;
   currentPersonNameByKey: Map<string, string>;
+  personRowsByKey: Map<string, AttainmentRow[]>;
   reportsByManager: Map<string, AttainmentRow[]>;
   managerRegion: Map<string, string>;
   managerNameByKey: Map<string, string>;
@@ -116,6 +118,7 @@ interface SalesCompHeaderInfo {
   emailCol: number;
   activeStatusCol: number;
   supervisoryManagerCol: number;
+  superiorOrganizationLevel01AwayCol: number | null;
   fullLegalNameCol: number | null;
 }
 
@@ -132,6 +135,7 @@ const CELL_ADDRESS_PATTERN = /^[A-Z]+[1-9][0-9]*$/;
 
 const SALES_COMP_REQUIRED_HEADERS = ['Employee ID', 'Email - Work', 'Active Status', 'Supervisory Manager'] as const;
 const SALES_COMP_FULL_LEGAL_NAME_HEADER = 'Full Legal Name';
+const SALES_COMP_LEVEL_01_AWAY_HEADER = 'Superior Organization - Level 01 Away';
 
 const ATT_COLUMNS = new Set([
   'Q1 Att',
@@ -210,6 +214,7 @@ const COLUMN_WIDTHS: Record<string, number> = {
 
 const LEVEL_FILL_COLORS = ['D6E4F0', 'E8F0E8', 'F5E6F0', 'FFF3E0', 'E0F7FA', 'F1F8E9', 'FCE4EC'];
 const SECTION_FILL_COLORS = ['F0E6D3', 'E3D5C1', 'D6C8B3', 'CBBDA8', 'C1B29D', 'B8A894', 'AF9E8B'];
+const MANAGER_SUMMARY_FILL_COLOR = 'DDE7F2';
 
 const HEADER_BG_COLOR = '1B3A5C';
 const HEADER_FONT_COLOR = 'FFFFFF';
@@ -400,6 +405,7 @@ export async function generateManagerReports(params: {
       managerKey,
       manager: index.managerNameByKey.get(managerKey) || managerKey,
       region: index.managerRegion.get(managerKey) || OTHER_REGION,
+      managerSummaryRows: getManagerSummaryRows(managerKey, index),
       hierarchyData: buildHierarchyData(managerKey, index, 0, new Set<string>()),
     }))
     .filter(
@@ -412,11 +418,11 @@ export async function generateManagerReports(params: {
   const reports: ManagerReportRecord[] = [];
 
   for (let i = 0; i < managersToGenerate.length; i += 1) {
-    const { manager, region, hierarchyData } = managersToGenerate[i];
+    const { manager, region, managerSummaryRows, hierarchyData } = managersToGenerate[i];
     const cleanName = extractManagerName(manager);
     const safeName = sanitizeFilename(cleanName);
     const fileName = `${fiscalYear}_Attainment_${safeName}_${reportDate}.xlsx`;
-    const bytes = await buildWorkbookBytes(manager, hierarchyData, fiscalYear);
+    const bytes = await buildWorkbookBytes(manager, managerSummaryRows, hierarchyData, fiscalYear);
     const attachmentBase64 = uint8ArrayToBase64(bytes);
     const managerId = normalizeEmployeeId(extractManagerId(manager));
     const email = managerId ? emailMap[managerId] || null : null;
@@ -643,18 +649,27 @@ function applySalesCompSupervisors(rows: AttainmentRow[], employeeRecords: Sales
 
     const salesCompRecord = employeeRecords[employeeId];
     const supervisoryManager = asString(salesCompRecord?.supervisoryManager);
-    if (!supervisoryManager || supervisoryManager === asString(row['Level_1_Manager'])) {
+    const superiorOrganizationLevel01Away = asString(salesCompRecord?.superiorOrganizationLevel01Away);
+    const nextLevel1Manager = supervisoryManager || asString(row['Level_1_Manager']);
+    const nextLevel2Manager = superiorOrganizationLevel01Away || asString(row['Level_2_Manager']);
+
+    if (
+      nextLevel1Manager === asString(row['Level_1_Manager']) &&
+      nextLevel2Manager === asString(row['Level_2_Manager'])
+    ) {
       return row;
     }
 
     return {
       ...row,
-      Level_1_Manager: supervisoryManager,
+      Level_1_Manager: nextLevel1Manager,
+      Level_2_Manager: nextLevel2Manager,
     };
   });
 }
 
 function buildIndexes(rows: AttainmentRow[]): BuildIndexResult {
+  const personRowsByKey = new Map<string, AttainmentRow[]>();
   const reportsByManager = new Map<string, AttainmentRow[]>();
   const managerRegion = buildManagerRegionMap(rows);
   const managerNameByKey = new Map<string, string>();
@@ -663,6 +678,13 @@ function buildIndexes(rows: AttainmentRow[]): BuildIndexResult {
 
   const managerSet = new Set<string>();
   for (const row of rows) {
+    const personKey = getPersonKeyFromRow(row);
+    if (personKey) {
+      const personRows = personRowsByKey.get(personKey) || [];
+      personRows.push(row);
+      personRowsByKey.set(personKey, personRows);
+    }
+
     const managerName = asString(row['Level_1_Manager']);
     const managerKey = getPersonKeyFromName(managerName);
     if (!managerName || !managerKey) {
@@ -683,6 +705,7 @@ function buildIndexes(rows: AttainmentRow[]): BuildIndexResult {
     currentManagerKeys,
     currentL1ManagerKeyByPersonKey,
     currentPersonNameByKey,
+    personRowsByKey,
     reportsByManager,
     managerRegion,
     managerNameByKey,
@@ -909,6 +932,10 @@ function hasNonTerminatedEmployeeRows(hierarchyData: HierarchyItem[]): boolean {
   return hierarchyData.some((item) => item.type === 'row' && !isTerminatedEmployeeStatus(item.row['Employee Status']));
 }
 
+function getManagerSummaryRows(managerKey: string, index: BuildIndexResult): AttainmentRow[] {
+  return sortReportRows(index.personRowsByKey.get(managerKey) || []);
+}
+
 function isTerminatedEmployeeStatus(value: unknown): boolean {
   return asString(value)?.toLowerCase() === 'terminated';
 }
@@ -969,6 +996,7 @@ function compareNullableNumbers(a: number | null, b: number | null, ascending: b
 
 async function buildWorkbookBytes(
   managerName: string,
+  managerSummaryRows: AttainmentRow[],
   hierarchyData: HierarchyItem[],
   fiscalYear: string,
 ): Promise<Uint8Array> {
@@ -991,7 +1019,6 @@ async function buildWorkbookBytes(
   }));
 
   worksheet.properties.outlineLevelRow = 0;
-  worksheet.views = [{ state: 'frozen', xSplit: 2, ySplit: headerRow }];
   worksheet.pageSetup = {
     orientation: 'landscape',
     fitToPage: true,
@@ -1014,16 +1041,32 @@ async function buildWorkbookBytes(
 
   worksheet.getRow(3).height = 6;
 
-  for (let colIndex = 1; colIndex <= numCols; colIndex += 1) {
-    const headerCell = worksheet.getCell(headerRow, colIndex);
-    headerCell.value = REPORT_COLUMNS[colIndex - 1];
-    headerCell.font = HEADER_FONT;
-    headerCell.fill = HEADER_FILL;
-    headerCell.border = THIN_BORDER;
-    headerCell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
-  }
-  worksheet.getRow(headerRow).height = 30;
+  writeHeaderRow(worksheet, headerRow);
   worksheet.autoFilter = `A${headerRow}:${colLetterLast}${headerRow}`;
+
+  if (managerSummaryRows.length > 0) {
+    const managerSummaryFill = getFillFromColor(MANAGER_SUMMARY_FILL_COLOR);
+    for (const row of managerSummaryRows) {
+      writeDataRow(worksheet, currentRow, row, managerSummaryFill, 0, true);
+      currentRow += 1;
+    }
+
+    if (hierarchyData.length > 0) {
+      worksheet.getRow(currentRow).height = 10;
+      currentRow += 1;
+
+      worksheet.mergeCells(currentRow, 1, currentRow, numCols);
+      const sectionCell = worksheet.getCell(currentRow, 1);
+      sectionCell.value = 'Team Attainment Records';
+      sectionCell.font = SECTION_FONT;
+      sectionCell.alignment = { horizontal: 'left', vertical: 'middle' };
+      applyRowFillAndBorder(worksheet, currentRow, numCols, getFillFromColor(SECTION_FILL_COLORS[0]), THIN_BORDER);
+      worksheet.getRow(currentRow).height = 22;
+      currentRow += 1;
+    }
+  }
+
+  worksheet.views = [{ state: 'frozen', xSplit: 2, ySplit: headerRow }];
 
   const groupRanges: Array<{ startRow: number; endRow: number; outlineLevel: number }> = [];
   const sectionStack: Array<{ startRow: number; depth: number }> = [];
@@ -1062,71 +1105,7 @@ async function buildWorkbookBytes(
     }
 
     const rowFill = getFillFromColor(LEVEL_FILL_COLORS[Math.min(item.depth, LEVEL_FILL_COLORS.length - 1)]);
-    const indent = '  '.repeat(item.depth);
-    const excelRow = worksheet.getRow(currentRow);
-
-    for (let colIndex = 1; colIndex <= numCols; colIndex += 1) {
-      const columnName = REPORT_COLUMNS[colIndex - 1];
-      const cell = worksheet.getCell(currentRow, colIndex);
-      const rawValue = normalizeExcelCellValue(item.row[columnName] ?? null);
-
-      cell.fill = rowFill;
-      cell.border = THIN_BORDER;
-      cell.font = DATA_FONT;
-      cell.alignment = { vertical: 'middle' };
-
-      if (columnName === 'Person Name' && indent) {
-        const nameText = asString(rawValue) || '';
-        cell.value = `${indent}${nameText}`;
-      } else {
-        cell.value = rawValue;
-      }
-
-      if (ATT_COLUMNS.has(columnName)) {
-        const numeric = asNumber(rawValue);
-        cell.alignment = { horizontal: 'right', vertical: 'middle' };
-        if (numeric !== null && numeric !== 0) {
-          cell.numFmt = '0.0%';
-          cell.font = getAttainmentFont(numeric);
-        } else {
-          cell.font = { name: 'Calibri', size: 10, color: { argb: 'FF999999' } };
-        }
-      } else if (NUMBER_COLUMNS.has(columnName)) {
-        const numeric = asNumber(rawValue);
-        cell.alignment = { horizontal: 'right', vertical: 'middle' };
-        if (numeric !== null && numeric !== 0) {
-          cell.numFmt = '#,##0';
-        }
-      } else if (columnName === 'Measure Weight') {
-        cell.alignment = { horizontal: 'center', vertical: 'middle' };
-        if (asNumber(rawValue) !== null) {
-          cell.numFmt = '0%';
-        }
-      } else if (columnName === 'Quota Start Date' || columnName === 'Quota End Date') {
-        cell.alignment = { horizontal: 'center', vertical: 'middle' };
-        const excelDateSerial = toExcelDateSerial(rawValue);
-        if (excelDateSerial !== null) {
-          cell.value = excelDateSerial;
-          cell.numFmt = 'YYYY-MM-DD';
-        } else if (rawValue !== null && rawValue !== '') {
-          cell.numFmt = 'YYYY-MM-DD';
-        }
-      } else if (columnName === 'LI_EMP_ID' || columnName === 'Fiscal Year') {
-        cell.alignment = { horizontal: 'center', vertical: 'middle' };
-      } else if (
-        columnName === 'Employee Status' ||
-        columnName === 'Level Grouping' ||
-        columnName === 'Level' ||
-        columnName === 'Region' ||
-        columnName === 'Country' ||
-        columnName === 'Business_Unit' ||
-        columnName === 'Plan_Period'
-      ) {
-        cell.alignment = { horizontal: 'center', vertical: 'middle' };
-      }
-    }
-
-    excelRow.height = 18;
+    writeDataRow(worksheet, currentRow, item.row, rowFill, item.depth);
     currentRow += 1;
   }
 
@@ -1166,6 +1145,101 @@ async function buildWorkbookBytes(
 
   const buffer = await workbook.xlsx.writeBuffer();
   return sanitizeWorkbookXml(new Uint8Array(buffer), maxOutlineLevel);
+}
+
+function writeHeaderRow(worksheet: ExcelJS.Worksheet, rowNumber: number): void {
+  for (let colIndex = 1; colIndex <= REPORT_COLUMNS.length; colIndex += 1) {
+    const headerCell = worksheet.getCell(rowNumber, colIndex);
+    headerCell.value = REPORT_COLUMNS[colIndex - 1];
+    headerCell.font = HEADER_FONT;
+    headerCell.fill = HEADER_FILL;
+    headerCell.border = THIN_BORDER;
+    headerCell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+  }
+
+  worksheet.getRow(rowNumber).height = 30;
+}
+
+function writeDataRow(
+  worksheet: ExcelJS.Worksheet,
+  rowNumber: number,
+  row: AttainmentRow,
+  fill: ExcelJS.Fill,
+  depth: number,
+  emphasizeName = false,
+): void {
+  const indent = '  '.repeat(depth);
+  const excelRow = worksheet.getRow(rowNumber);
+
+  for (let colIndex = 1; colIndex <= REPORT_COLUMNS.length; colIndex += 1) {
+    const columnName = REPORT_COLUMNS[colIndex - 1];
+    const cell = worksheet.getCell(rowNumber, colIndex);
+    const rawValue = normalizeExcelCellValue(row[columnName] ?? null);
+
+    cell.fill = fill;
+    cell.border = THIN_BORDER;
+    cell.font = DATA_FONT;
+    cell.alignment = { vertical: 'middle' };
+
+    if (columnName === 'Person Name' && indent) {
+      const nameText = asString(rawValue) || '';
+      cell.value = `${indent}${nameText}`;
+    } else {
+      cell.value = rawValue;
+    }
+
+    if (ATT_COLUMNS.has(columnName)) {
+      const numeric = asNumber(rawValue);
+      cell.alignment = { horizontal: 'right', vertical: 'middle' };
+      if (numeric !== null && numeric !== 0) {
+        cell.numFmt = '0.0%';
+        cell.font = getAttainmentFont(numeric);
+      } else {
+        cell.font = { name: 'Calibri', size: 10, color: { argb: 'FF999999' } };
+      }
+    } else if (NUMBER_COLUMNS.has(columnName)) {
+      const numeric = asNumber(rawValue);
+      cell.alignment = { horizontal: 'right', vertical: 'middle' };
+      if (numeric !== null && numeric !== 0) {
+        cell.numFmt = '#,##0';
+      }
+    } else if (columnName === 'Measure Weight') {
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      if (asNumber(rawValue) !== null) {
+        cell.numFmt = '0%';
+      }
+    } else if (columnName === 'Quota Start Date' || columnName === 'Quota End Date') {
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+      const excelDateSerial = toExcelDateSerial(rawValue);
+      if (excelDateSerial !== null) {
+        cell.value = excelDateSerial;
+        cell.numFmt = 'YYYY-MM-DD';
+      } else if (rawValue !== null && rawValue !== '') {
+        cell.numFmt = 'YYYY-MM-DD';
+      }
+    } else if (columnName === 'LI_EMP_ID' || columnName === 'Fiscal Year') {
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+    } else if (
+      columnName === 'Employee Status' ||
+      columnName === 'Level Grouping' ||
+      columnName === 'Level' ||
+      columnName === 'Region' ||
+      columnName === 'Country' ||
+      columnName === 'Business_Unit' ||
+      columnName === 'Plan_Period'
+    ) {
+      cell.alignment = { horizontal: 'center', vertical: 'middle' };
+    }
+
+    if (emphasizeName && columnName === 'Person Name') {
+      cell.font = {
+        ...(cell.font || DATA_FONT),
+        bold: true,
+      };
+    }
+  }
+
+  excelRow.height = 18;
 }
 
 function normalizeExcelCellValue(value: CellValue): string | number | boolean | Date | null {
@@ -1477,6 +1551,7 @@ function findSalesCompHeaderInfo(sheet: XLSX.WorkSheet): SalesCompHeaderInfo | n
         emailCol,
         activeStatusCol,
         supervisoryManagerCol,
+        superiorOrganizationLevel01AwayCol: headerColumns.get(SALES_COMP_LEVEL_01_AWAY_HEADER) ?? null,
         fullLegalNameCol: headerColumns.get(SALES_COMP_FULL_LEGAL_NAME_HEADER) ?? null,
       };
     }
@@ -1495,6 +1570,7 @@ function buildSalesCompRecords(
   const emailsByRow = new Map<number, unknown>();
   const activeStatusesByRow = new Map<number, unknown>();
   const supervisoryManagersByRow = new Map<number, unknown>();
+  const superiorOrganizationLevel01AwayByRow = new Map<number, unknown>();
   const fullLegalNamesByRow = new Map<number, unknown>();
 
   for (const key of Object.keys(sheet)) {
@@ -1516,6 +1592,11 @@ function buildSalesCompRecords(
       activeStatusesByRow.set(cellAddress.r, cellValue);
     } else if (cellAddress.c === headerInfo.supervisoryManagerCol) {
       supervisoryManagersByRow.set(cellAddress.r, cellValue);
+    } else if (
+      headerInfo.superiorOrganizationLevel01AwayCol !== null &&
+      cellAddress.c === headerInfo.superiorOrganizationLevel01AwayCol
+    ) {
+      superiorOrganizationLevel01AwayByRow.set(cellAddress.r, cellValue);
     } else if (headerInfo.fullLegalNameCol !== null && cellAddress.c === headerInfo.fullLegalNameCol) {
       fullLegalNamesByRow.set(cellAddress.r, cellValue);
     }
@@ -1532,6 +1613,7 @@ function buildSalesCompRecords(
       email,
       activeStatus: asString(activeStatusesByRow.get(rowIndex)),
       supervisoryManager: asString(supervisoryManagersByRow.get(rowIndex)),
+      superiorOrganizationLevel01Away: asString(superiorOrganizationLevel01AwayByRow.get(rowIndex)),
       fullName: asString(fullLegalNamesByRow.get(rowIndex)),
     };
 

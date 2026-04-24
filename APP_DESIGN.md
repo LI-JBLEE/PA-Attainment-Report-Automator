@@ -55,7 +55,9 @@
 
 ## 5-1) 리포트 생성 로직
 - Attainment row의 `LI_EMP_ID`를 Sales Compensation Report의 `Employee ID`와 매칭합니다.
-- SCR에 `Supervisory Manager`가 있으면 리포트 생성 시 `Level_1_Manager` 대신 SCR 기준 매니저를 사용합니다.
+- 리포트 생성 시 `Level_1_Manager`는 SCR의 `Supervisory Manager`를 사용합니다.
+- 리포트 생성 시 `Level_2_Manager`는 SCR의 `Superior Organization - Level 01 Away`를 사용합니다.
+- 각 매니저 리포트 상단에는 매니저 본인의 row를 먼저 배치하고, 이후 팀 row는 간격을 둔 뒤 별도 섹션으로 이어집니다.
 - 생성될 리포트 row가 모두 `Employee Status = Terminated`인 매니저는 리포트/Draft 대상에서 제외합니다.
 - 각 매니저 리포트의 row는 `LI_EMP_ID` 오름차순, `Quota Start Date` 오름차순, `Measure Weight` 내림차순으로 정렬합니다.
 
@@ -70,6 +72,9 @@
 - 화면 구조: `attainment-report-powerapp/src/App.tsx`
 
 ## 8) 변경 이력
+- 2026-04-24
+  - `Level_2_Manager`를 Global Attainment Report 원본 대신 SCR의 `Superior Organization - Level 01 Away` 기준으로 보정
+  - 각 매니저 리포트 상단에 매니저 본인 row를 추가하고 팀 데이터와 시각적으로 분리
 - 2026-04-23
   - Sales Compensation Report의 `Supervisory Manager`를 기준으로 현재 매니저 조직도를 보정
   - 퇴사자만 포함된 매니저 리포트 생성 제외
